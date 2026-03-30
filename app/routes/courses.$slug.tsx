@@ -1,5 +1,5 @@
-import { useEffect } from "react";
-import { Link, useSearchParams } from "react-router";
+import React, { useEffect } from "react";
+import { Form, Link, useSearchParams } from "react-router";
 import { toast } from "sonner";
 import type { Route } from "./+types/courses.$slug";
 import {
@@ -42,6 +42,13 @@ import { formatDuration, formatPrice } from "~/lib/utils";
 import { renderMarkdown } from "~/lib/markdown.server";
 import { resolveCountry } from "~/lib/country.server";
 import { calculatePppPrice, getCountryTierInfo } from "~/lib/ppp";
+import {
+  getAverageRatingForCourse,
+  getCourseRatingByUser,
+  upsertCourseRating,
+} from "~/services/ratingService";
+import { StarRating } from "~/components/star-rating";
+import { Star } from "lucide-react";
 
 export function meta({ data: loaderData }: Route.MetaArgs) {
   const title = loaderData?.course?.title ?? "Course";
@@ -102,6 +109,13 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     : courseWithDetails.price;
   const tierInfo = getCountryTierInfo(country);
 
+  const { average: averageRating, count: ratingCount } =
+    getAverageRatingForCourse(course.id);
+  const userRating =
+    currentUserId && enrolled
+      ? (getCourseRatingByUser(currentUserId, course.id)?.rating ?? null)
+      : null;
+
   return {
     course: courseWithDetails,
     salesCopyHtml,
@@ -113,10 +127,41 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     currentUserId,
     pppPrice,
     tierInfo,
+    averageRating,
+    ratingCount,
+    userRating,
   };
 }
 
-// No action — enrollment is handled via the purchase confirmation page
+export async function action({ params, request }: Route.ActionArgs) {
+  const currentUserId = await getCurrentUserId(request);
+  if (!currentUserId) {
+    throw data("Unauthorized", { status: 401 });
+  }
+
+  const formData = await request.formData();
+  const intent = formData.get("intent");
+
+  if (intent === "rate-course") {
+    const course = getCourseBySlug(params.slug);
+    if (!course) throw data("Course not found", { status: 404 });
+
+    const { isUserEnrolled } = await import("~/services/enrollmentService");
+    if (!isUserEnrolled(currentUserId, course.id)) {
+      throw data("Must be enrolled to rate this course", { status: 403 });
+    }
+
+    const ratingRaw = Number(formData.get("rating"));
+    if (!Number.isInteger(ratingRaw) || ratingRaw < 1 || ratingRaw > 5) {
+      throw data("Rating must be an integer between 1 and 5", { status: 400 });
+    }
+
+    upsertCourseRating(currentUserId, course.id, ratingRaw);
+    return { success: true };
+  }
+
+  throw data("Unknown intent", { status: 400 });
+}
 
 export function HydrateFallback() {
   return (
@@ -181,6 +226,9 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
     currentUserId,
     pppPrice,
     tierInfo,
+    averageRating,
+    ratingCount,
+    userRating,
   } = loaderData;
   const isInstructor = currentUserId === course.instructorId;
   const [searchParams, setSearchParams] = useSearchParams();
@@ -301,7 +349,7 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
         <p className="mb-4 text-lg text-muted-foreground">
           {course.description}
         </p>
-        <div className="flex items-center gap-4 text-sm text-muted-foreground">
+        <div className="flex flex-wrap items-center gap-4 text-sm text-muted-foreground">
           <span className="flex items-center gap-1.5">
             <UserAvatar
               name={course.instructorName}
@@ -320,7 +368,16 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
               {formatDuration(totalDuration, true, false, false)} total
             </span>
           )}
+          {averageRating !== null && (
+            <StarRating average={averageRating} count={ratingCount} />
+          )}
         </div>
+
+        {enrolled && !isInstructor && (
+          <div className="mt-4">
+            <RatingPicker courseSlug={course.slug} userRating={userRating} />
+          </div>
+        )}
       </div>
 
       {/* Two-column: sales copy left, sidebar right */}
@@ -585,6 +642,50 @@ function CourseContent({
         </div>
       )}
     </div>
+  );
+}
+
+function RatingPicker({
+  courseSlug,
+  userRating,
+}: {
+  courseSlug: string;
+  userRating: number | null;
+}) {
+  const [hovered, setHovered] = React.useState<number | null>(null);
+  const activeRating = hovered ?? userRating;
+
+  return (
+    <Form method="post" className="flex items-center gap-2">
+      <input type="hidden" name="intent" value="rate-course" />
+      <span className="text-sm text-muted-foreground">
+        {userRating ? "Your rating:" : "Rate this course:"}
+      </span>
+      <div
+        className="flex items-center gap-0.5"
+        onMouseLeave={() => setHovered(null)}
+      >
+        {[1, 2, 3, 4, 5].map((star) => (
+          <button
+            key={star}
+            type="submit"
+            name="rating"
+            value={star}
+            onMouseEnter={() => setHovered(star)}
+            className="rounded p-0.5 transition-transform hover:scale-110 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            aria-label={`Rate ${star} star${star > 1 ? "s" : ""}`}
+          >
+            <Star
+              className={
+                activeRating !== null && star <= activeRating
+                  ? "size-5 fill-amber-400 text-amber-400"
+                  : "size-5 fill-none text-muted-foreground"
+              }
+            />
+          </button>
+        ))}
+      </div>
+    </Form>
   );
 }
 
